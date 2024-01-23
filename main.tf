@@ -1,255 +1,152 @@
-module "os" {
-  source       = "./os"
-  vm_os_simple = "${var.vm_os_simple}"
+#-------------------------------
+# Local Declarations
+#-------------------------------
+locals {
+  account_tier             = (var.account_kind == "FileStorage" ? "Premium" : split("_", var.skuname)[0])
+  account_replication_type = (local.account_tier == "Premium" ? "LRS" : split("_", var.skuname)[1])
+  resource_group_name      = element(coalescelist(data.azurerm_resource_group.rgrp.*.name, azurerm_resource_group.rg.*.name, [""]), 0)
+  location                 = element(coalescelist(data.azurerm_resource_group.rgrp.*.location, azurerm_resource_group.rg.*.location, [""]), 0)
 }
 
-resource "azurerm_resource_group" "vm" {
-  name     = "${var.resource_group_name}"
-  location = "${var.location}"
-  tags     = "${var.tags}"
+#---------------------------------------------------------
+# Resource Group Creation or selection - Default is "false"
+#----------------------------------------------------------
+data "azurerm_resource_group" "rgrp" {
+  count = var.create_resource_group == false ? 1 : 0
+  name  = var.resource_group_name
 }
 
-resource "random_id" "vm-sa" {
-  keepers = {
-    vm_hostname = "${var.vm_hostname}"
-  }
-
-  byte_length = 6
+resource "azurerm_resource_group" "rg" {
+  count    = var.create_resource_group ? 1 : 0
+  name     = lower(var.resource_group_name)
+  location = var.location
+  tags     = merge({ "ResourceName" = format("%s", var.resource_group_name) }, var.tags, )
 }
 
-resource "azurerm_storage_account" "vm-sa" {
-  count                    = "${var.boot_diagnostics == "true" ? 1 : 0}"
-  name                     = "bootdiag${lower(random_id.vm-sa.hex)}"
-  resource_group_name      = "${azurerm_resource_group.vm.name}"
-  location                 = "${var.location}"
-  account_tier             = "${element(split("_", var.boot_diagnostics_sa_type),0)}"
-  account_replication_type = "${element(split("_", var.boot_diagnostics_sa_type),1)}"
-  tags                     = "${var.tags}"
+#---------------------------------------------------------
+# Storage Account Creation or selection 
+#----------------------------------------------------------
+resource "random_string" "unique" {
+  length  = 6
+  special = false
+  upper   = false
 }
 
-resource "azurerm_virtual_machine" "vm-linux" {
-  count                         = "${!contains(list("${var.vm_os_simple}","${var.vm_os_offer}"), "WindowsServer") && var.is_windows_image != "true" && var.data_disk == "false" ? var.nb_instances : 0}"
-  name                          = "${var.vm_hostname}${count.index}"
-  location                      = "${var.location}"
-  resource_group_name           = "${azurerm_resource_group.vm.name}"
-  availability_set_id           = "${azurerm_availability_set.vm.id}"
-  vm_size                       = "${var.vm_size}"
-  network_interface_ids         = ["${element(azurerm_network_interface.vm.*.id, count.index)}"]
-  delete_os_disk_on_termination = "${var.delete_os_disk_on_termination}"
+resource "azurerm_storage_account" "storeacc" {
+  name                      = substr(format("sta%s%s", lower(replace(var.storage_account_name, "/[[:^alnum:]]/", "")), random_string.unique.result), 0, 24)
+  resource_group_name       = local.resource_group_name
+  location                  = local.location
+  account_kind              = var.account_kind
+  account_tier              = local.account_tier
+  account_replication_type  = local.account_replication_type
+  enable_https_traffic_only = true
+  min_tls_version           = var.min_tls_version
+  tags                      = merge({ "ResourceName" = substr(format("sta%s%s", lower(replace(var.storage_account_name, "/[[:^alnum:]]/", "")), random_string.unique.result), 0, 24) }, var.tags, )
 
-  storage_image_reference {
-    id        = "${var.vm_os_id}"
-    publisher = "${var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""}"
-    offer     = "${var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""}"
-    sku       = "${var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""}"
-    version   = "${var.vm_os_id == "" ? var.vm_os_version : ""}"
-  }
-
-  storage_os_disk {
-    name              = "osdisk-${var.vm_hostname}-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = "${var.storage_account_type}"
-  }
-
-  os_profile {
-    computer_name  = "${var.vm_hostname}${count.index}"
-    admin_username = "${var.admin_username}"
-    admin_password = "${var.admin_password}"
-  }
-
-  os_profile_linux_config {
-    disable_password_authentication = true
-
-    ssh_keys {
-      path     = "/home/${var.admin_username}/.ssh/authorized_keys"
-      key_data = "${file("${var.ssh_key}")}"
+  dynamic "identity" {
+    for_each = var.managed_identity_type != null ? [1] : []
+    content {
+      type         = var.managed_identity_type
+      identity_ids = var.managed_identity_type == "UserAssigned" || var.managed_identity_type == "SystemAssigned, UserAssigned" ? var.managed_identity_ids : null
     }
   }
 
-  tags = "${var.tags}"
-
-  boot_diagnostics {
-    enabled     = "${var.boot_diagnostics}"
-    storage_uri = "${var.boot_diagnostics == "true" ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : "" }"
-  }
-}
-
-resource "azurerm_virtual_machine" "vm-linux-with-datadisk" {
-  count                         = "${!contains(list("${var.vm_os_simple}","${var.vm_os_offer}"), "WindowsServer")  && var.is_windows_image != "true"  && var.data_disk == "true" ? var.nb_instances : 0}"
-  name                          = "${var.vm_hostname}${count.index}"
-  location                      = "${var.location}"
-  resource_group_name           = "${azurerm_resource_group.vm.name}"
-  availability_set_id           = "${azurerm_availability_set.vm.id}"
-  vm_size                       = "${var.vm_size}"
-  network_interface_ids         = ["${element(azurerm_network_interface.vm.*.id, count.index)}"]
-  delete_os_disk_on_termination = "${var.delete_os_disk_on_termination}"
-
-  storage_image_reference {
-    id        = "${var.vm_os_id}"
-    publisher = "${var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""}"
-    offer     = "${var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""}"
-    sku       = "${var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""}"
-    version   = "${var.vm_os_id == "" ? var.vm_os_version : ""}"
+  blob_properties {
+    delete_retention_policy {
+      days = var.blob_soft_delete_retention_days
+    }
+    container_delete_retention_policy {
+      days = var.container_soft_delete_retention_days
+    }
+    versioning_enabled       = var.enable_versioning
+    last_access_time_enabled = var.last_access_time_enabled
+    change_feed_enabled      = var.change_feed_enabled
   }
 
-  storage_os_disk {
-    name              = "osdisk-${var.vm_hostname}-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = "${var.storage_account_type}"
-  }
-
-  storage_data_disk {
-    name              = "datadisk-${var.vm_hostname}-${count.index}"
-    create_option     = "Empty"
-    lun               = 0
-    disk_size_gb      = "${var.data_disk_size_gb}"
-    managed_disk_type = "${var.data_sa_type}"
-  }
-
-  os_profile {
-    computer_name  = "${var.vm_hostname}${count.index}"
-    admin_username = "${var.admin_username}"
-    admin_password = "${var.admin_password}"
-  }
-
-  os_profile_linux_config {
-    disable_password_authentication = true
-
-    ssh_keys {
-      path     = "/home/${var.admin_username}/.ssh/authorized_keys"
-      key_data = "${file("${var.ssh_key}")}"
+  dynamic "network_rules" {
+    for_each = var.network_rules != null ? ["true"] : []
+    content {
+      default_action             = "Deny"
+      bypass                     = var.network_rules.bypass
+      ip_rules                   = var.network_rules.ip_rules
+      virtual_network_subnet_ids = var.network_rules.subnet_ids
     }
   }
-
-  tags = "${var.tags}"
-
-  boot_diagnostics {
-    enabled     = "${var.boot_diagnostics}"
-    storage_uri = "${var.boot_diagnostics == "true" ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : "" }"
-  }
 }
 
-resource "azurerm_virtual_machine" "vm-windows" {
-  count                         = "${(((var.vm_os_id != "" && var.is_windows_image == "true") || contains(list("${var.vm_os_simple}","${var.vm_os_offer}"), "WindowsServer")) && var.data_disk == "false") ? var.nb_instances : 0}"
-  name                          = "${var.vm_hostname}${count.index}"
-  location                      = "${var.location}"
-  resource_group_name           = "${azurerm_resource_group.vm.name}"
-  availability_set_id           = "${azurerm_availability_set.vm.id}"
-  vm_size                       = "${var.vm_size}"
-  network_interface_ids         = ["${element(azurerm_network_interface.vm.*.id, count.index)}"]
-  delete_os_disk_on_termination = "${var.delete_os_disk_on_termination}"
-
-  storage_image_reference {
-    id        = "${var.vm_os_id}"
-    publisher = "${var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""}"
-    offer     = "${var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""}"
-    sku       = "${var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""}"
-    version   = "${var.vm_os_id == "" ? var.vm_os_version : ""}"
-  }
-
-  storage_os_disk {
-    name              = "osdisk-${var.vm_hostname}-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = "${var.storage_account_type}"
-  }
-
-  os_profile {
-    computer_name  = "${var.vm_hostname}${count.index}"
-    admin_username = "${var.admin_username}"
-    admin_password = "${var.admin_password}"
-  }
-
-  tags = "${var.tags}"
-
-  os_profile_windows_config {}
-
-  boot_diagnostics {
-    enabled     = "${var.boot_diagnostics}"
-    storage_uri = "${var.boot_diagnostics == "true" ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : "" }"
-  }
+#--------------------------------------
+# Storage Advanced Threat Protection 
+#--------------------------------------
+resource "azurerm_advanced_threat_protection" "atp" {
+  target_resource_id = azurerm_storage_account.storeacc.id
+  enabled            = var.enable_advanced_threat_protection
 }
 
-resource "azurerm_virtual_machine" "vm-windows-with-datadisk" {
-  count                         = "${((var.vm_os_id != "" && var.is_windows_image == "true") || contains(list("${var.vm_os_simple}","${var.vm_os_offer}"), "WindowsServer")) && var.data_disk == "true" ? var.nb_instances : 0}"
-  name                          = "${var.vm_hostname}${count.index}"
-  location                      = "${var.location}"
-  resource_group_name           = "${azurerm_resource_group.vm.name}"
-  availability_set_id           = "${azurerm_availability_set.vm.id}"
-  vm_size                       = "${var.vm_size}"
-  network_interface_ids         = ["${element(azurerm_network_interface.vm.*.id, count.index)}"]
-  delete_os_disk_on_termination = "${var.delete_os_disk_on_termination}"
-
-  storage_image_reference {
-    id        = "${var.vm_os_id}"
-    publisher = "${var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""}"
-    offer     = "${var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""}"
-    sku       = "${var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""}"
-    version   = "${var.vm_os_id == "" ? var.vm_os_version : ""}"
-  }
-
-  storage_os_disk {
-    name              = "osdisk-${var.vm_hostname}-${count.index}"
-    create_option     = "FromImage"
-    caching           = "ReadWrite"
-    managed_disk_type = "${var.storage_account_type}"
-  }
-
-  storage_data_disk {
-    name              = "datadisk-${var.vm_hostname}-${count.index}"
-    create_option     = "Empty"
-    lun               = 0
-    disk_size_gb      = "${var.data_disk_size_gb}"
-    managed_disk_type = "${var.data_sa_type}"
-  }
-
-  os_profile {
-    computer_name  = "${var.vm_hostname}${count.index}"
-    admin_username = "${var.admin_username}"
-    admin_password = "${var.admin_password}"
-  }
-
-  tags = "${var.tags}"
-
-  os_profile_windows_config {}
-
-  boot_diagnostics {
-    enabled     = "${var.boot_diagnostics}"
-    storage_uri = "${var.boot_diagnostics == "true" ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : "" }"
-  }
+#-------------------------------
+# Storage Container Creation
+#-------------------------------
+resource "azurerm_storage_container" "container" {
+  count                 = length(var.containers_list)
+  name                  = var.containers_list[count.index].name
+  storage_account_name  = azurerm_storage_account.storeacc.name
+  container_access_type = var.containers_list[count.index].access_type
 }
 
-resource "azurerm_availability_set" "vm" {
-  name                         = "${var.vm_hostname}-avset"
-  location                     = "${azurerm_resource_group.vm.location}"
-  resource_group_name          = "${azurerm_resource_group.vm.name}"
-  platform_fault_domain_count  = 2
-  platform_update_domain_count = 2
-  managed                      = true
+#-------------------------------
+# Storage Fileshare Creation
+#-------------------------------
+resource "azurerm_storage_share" "fileshare" {
+  count                = length(var.file_shares)
+  name                 = var.file_shares[count.index].name
+  storage_account_name = azurerm_storage_account.storeacc.name
+  quota                = var.file_shares[count.index].quota
 }
 
-resource "azurerm_public_ip" "vm" {
-  count                        = "${var.nb_public_ip}"
-  name                         = "${var.vm_hostname}-${count.index}-publicIP"
-  location                     = "${var.location}"
-  resource_group_name          = "${azurerm_resource_group.vm.name}"
-  public_ip_address_allocation = "${var.public_ip_address_allocation}"
-  domain_name_label            = "${element(var.public_ip_dns, count.index)}"
+#-------------------------------
+# Storage Tables Creation
+#-------------------------------
+resource "azurerm_storage_table" "tables" {
+  count                = length(var.tables)
+  name                 = var.tables[count.index]
+  storage_account_name = azurerm_storage_account.storeacc.name
 }
 
-resource "azurerm_network_interface" "vm" {
-  count                     = "${var.nb_instances}"
-  name                      = "nic-${var.vm_hostname}-${count.index}"
-  location                  = "${azurerm_resource_group.vm.location}"
-  resource_group_name       = "${azurerm_resource_group.vm.name}"
-  network_security_group_id = "${var.nsg_id}"
+#-------------------------------
+# Storage Queue Creation
+#-------------------------------
+resource "azurerm_storage_queue" "queues" {
+  count                = length(var.queues)
+  name                 = var.queues[count.index]
+  storage_account_name = azurerm_storage_account.storeacc.name
+}
 
-  ip_configuration {
-    name                          = "ipconfig${count.index}"
-    subnet_id                     = "${var.vnet_subnet_id}"
-    private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = "${length(azurerm_public_ip.vm.*.id) > 0 ? element(concat(azurerm_public_ip.vm.*.id, list("")), count.index) : ""}"
+#-------------------------------
+# Storage Lifecycle Management
+#-------------------------------
+resource "azurerm_storage_management_policy" "lcpolicy" {
+  count              = length(var.lifecycles) == 0 ? 0 : 1
+  storage_account_id = azurerm_storage_account.storeacc.id
+
+  dynamic "rule" {
+    for_each = var.lifecycles
+    iterator = rule
+    content {
+      name    = "rule${rule.key}"
+      enabled = true
+      filters {
+        prefix_match = rule.value.prefix_match
+        blob_types   = ["blockBlob"]
+      }
+      actions {
+        base_blob {
+          tier_to_cool_after_days_since_modification_greater_than    = rule.value.tier_to_cool_after_days
+          tier_to_archive_after_days_since_modification_greater_than = rule.value.tier_to_archive_after_days
+          delete_after_days_since_modification_greater_than          = rule.value.delete_after_days
+        }
+        snapshot {
+          delete_after_days_since_creation_greater_than = rule.value.snapshot_delete_after_days
+        }
+      }
+    }
   }
 }
